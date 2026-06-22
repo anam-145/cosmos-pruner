@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	cmtstate "github.com/cometbft/cometbft/api/cometbft/state/v1"
-	cmtstore "github.com/cometbft/cometbft/api/cometbft/store/v1"
 
 	"github.com/binaryholdings/cosmos-pruner/cmd/celestia"
 	"github.com/cosmos/gogoproto/proto"
@@ -45,10 +44,6 @@ var blockKeyInfos = []PrefixAndSplitter{
 var stateKeyInfos = []string{
 	"abciResponsesKey:",
 	"consensusParamsKey:",
-}
-
-var appKeyInfos = []string{
-	"s/",
 }
 
 func pruneBlockStore(blockStoreDB db.DB, pruneHeight uint64) error {
@@ -360,41 +355,4 @@ func deleteHeightRange(db db.DB, key string, startHeight, endHeight uint64, heig
 	}
 
 	return pruned, nil
-}
-
-var blockStoreKey = []byte("blockStore")
-
-// Set the blockstore base to the height we've just pruned.
-// Otherwise, peers requesting blocks before the blockstore's base
-// may crash the node.
-func SetBlockStoreStateBase(db db.DB, base uint64) error {
-	logger.Info("Getting blockstore key to set base")
-	bytes, err := db.Get(blockStoreKey)
-	if err != nil {
-		logger.Error("failed to load blockStoreKey, not setting base")
-		return err
-	}
-
-	if len(bytes) == 0 {
-		logger.Info("empty blockstore key")
-		return nil
-	}
-	logger.Info("Got valid key to set base")
-
-	var bsj cmtstore.BlockStoreState
-	if err := proto.Unmarshal(bytes, &bsj); err != nil {
-		return fmt.Errorf("BlockStore state base: Could not unmarshal bytes: %X", bytes)
-	}
-
-	bsj.Base = int64(base)
-	logger.Info("Setting blockstore base", "base", base)
-	bytes, err = proto.Marshal(&bsj)
-	if err != nil {
-		return fmt.Errorf("failed to marshal bsj: %w", err)
-	}
-	err = db.Set(blockStoreKey, bytes)
-	if err != nil {
-		return fmt.Errorf("failed to set blockstore key: %w", err)
-	}
-	return nil
 }
