@@ -197,7 +197,21 @@ func pruneBlockAndStateStore(blockStoreDB, stateStoreDB db.DB, pruneHeight uint6
 	if err != nil {
 		return err
 	}
-	err = SetBlockStoreStateBase(blockStoreDB, pruneHeight+1)
+
+	// Set the blockstore base to the actual lowest surviving block meta, so cometbft's
+	// LoadBaseMeta(base) finds a real block and /status reports earliest_block_* instead
+	// of empty values. Fall back to pruneHeight+1 if the scan finds nothing/errors.
+	base := pruneHeight + 1
+	if lowest, ok, scanErr := findLowestBlockHeight(blockStoreDB); scanErr != nil {
+		logger.Error("could not scan for lowest surviving block height, using pruneHeight+1", "err", scanErr, "base", base)
+	} else if ok {
+		base = lowest
+		logger.Info("Lowest surviving block height", "base", base)
+	} else {
+		logger.Warn("no block meta (H:) keys found, using pruneHeight+1", "base", base)
+	}
+
+	err = SetBlockStoreStateBase(blockStoreDB, base)
 	logger.Info("Finished pruning block and state stores")
 	return err
 }
@@ -360,6 +374,49 @@ func deleteHeightRange(db db.DB, key string, startHeight, endHeight uint64, heig
 }
 
 var blockStoreKey = []byte("blockStore")
+
+// findLowestBlockHeight scans the surviving block meta keys ("H:<height>") and returns
+// the smallest height still present, plus whether any was found.
+//
+// Block meta heights are ascii-encoded WITHOUT zero padding (celestia-core/cometbft write
+// them as "H:%v"), so they do not sort numerically. We scan the whole "H:" prefix and
+// track the minimum parsed height. The blockstore only holds the retained blocks after
+// pruning, so this is a bounded one-shot scan.
+//
+// This is used to set the blockstore base to a height whose block meta actually exists,
+// so cometbft's LoadBaseMeta(base) succeeds and /status reports earliest_block_* instead
+// of empty values (which happen when base is 0 or points at a deleted meta).
+func findLowestBlockHeight(db db.DB) (uint64, bool, error) {
+	prefix := []byte("H:")
+	rangeEnd := make([]byte, len(prefix))
+	copy(rangeEnd, prefix)
+	rangeEnd[len(rangeEnd)-1]++ // "H;" — upper bound covering every "H:" key
+
+	iter, err := db.Iterator(prefix, rangeEnd)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var lowest uint64
+	found := false
+	for ; iter.Valid(); iter.Next() {
+		numberPart := iter.Key()[len(prefix):]
+		h, err := asciiHeightParser(string(numberPart))
+		if err != nil {
+			logger.Error("Failed to parse block meta height", "key", string(iter.Key()), "err", err)
+			continue
+		}
+		if !found || h < lowest {
+			lowest = h
+			found = true
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, false, err
+	}
+	return lowest, found, nil
+}
 
 // Set the blockstore base to the height we've just pruned.
 // Otherwise, peers requesting blocks before the blockstore's base
