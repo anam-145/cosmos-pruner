@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -58,6 +59,51 @@ func setConfig(cfg *log.Config) {
 	cfg.Level = zerolog.InfoLevel
 }
 
+// verifyAppState reopens the application DB after a prune/restore, reloads the kept
+// version, and checks that every mounted IAVL store's root hash still matches the
+// commit info captured before the operation (want). A mismatch means the operation
+// changed the app hash — e.g. a snapshot restore that rehashed the tree with a
+// different iavl version, or an in-place prune that deleted a live node — which would
+// make the node fail consensus and is unrecoverable in place. Returning an error here
+// stops the run before chown, so the operator can restore from backup / re-statesync.
+//
+// Per-store comparison is used (not the aggregate app hash) so that stores skipped for
+// empty hashes do not produce false mismatches; if every kept store's root is intact the
+// app hash is intact by construction.
+func verifyAppState(appDB db.DB, ver int64, want *storetypes.CommitInfo, keys map[string]*storetypes.KVStoreKey, iavlDisableFastNode bool) error {
+	vs := rootmulti.NewStore(appDB, logger, metrics.NewNoOpMetrics())
+	vs.SetIAVLDisableFastNode(iavlDisableFastNode)
+	for _, key := range keys {
+		vs.MountStoreWithDB(key, storetypes.StoreTypeIAVL, nil)
+	}
+	if err := vs.LoadVersion(ver); err != nil {
+		return fmt.Errorf("post-prune verify: failed to reload version %d: %w", ver, err)
+	}
+
+	wantByName := make(map[string][]byte, len(want.StoreInfos))
+	for _, si := range want.StoreInfos {
+		wantByName[si.Name] = si.CommitId.Hash
+	}
+
+	for name, key := range keys {
+		sub := vs.GetCommitKVStore(key)
+		if sub == nil {
+			return fmt.Errorf("post-prune verify: store %q missing after prune", name)
+		}
+		got := sub.LastCommitID().Hash
+		exp, ok := wantByName[name]
+		if !ok {
+			return fmt.Errorf("post-prune verify: store %q not present in pre-prune commit info", name)
+		}
+		if !bytes.Equal(got, exp) {
+			return fmt.Errorf("post-prune verify: store %q root hash changed (got %X want %X) — app hash broken, aborting", name, got, exp)
+		}
+	}
+
+	logger.Info("post-prune verify OK", "version", ver, "storesVerified", len(keys))
+	return nil
+}
+
 func PruneAppState(params *ApplicationPrunerParams) (bool, error) {
 	logger.Info("pruning application state (not using snapshot)", "params", params)
 
@@ -65,12 +111,14 @@ func PruneAppState(params *ApplicationPrunerParams) (bool, error) {
 	appStore.SetIAVLDisableFastNode(params.iavlDisableFastNode)
 	ver := rootmulti.GetLatestVersion(params.appDB)
 
+	var preCommitInfo *storetypes.CommitInfo
 	storeNames := []string{}
 	if ver != 0 {
 		cInfo, err := appStore.GetCommitInfo(ver)
 		if err != nil {
 			return false, err
 		}
+		preCommitInfo = cInfo
 
 		for _, storeInfo := range cInfo.StoreInfos {
 			// we only want to prune the stores with actual data.
@@ -110,6 +158,12 @@ func PruneAppState(params *ApplicationPrunerParams) (bool, error) {
 
 		if err := appStore.PruneStores(targetHeight); err != nil {
 			logger.Error("error pruning app state", "err", err)
+		}
+	}
+
+	if verifyAfterPrune && ver != 0 && preCommitInfo != nil {
+		if err := verifyAppState(params.appDB, ver, preCommitInfo, keys, params.iavlDisableFastNode); err != nil {
+			return false, err
 		}
 	}
 
@@ -236,6 +290,17 @@ func SnapshotAndRestoreApp(params *ApplicationPrunerParams) (bool, error) {
 		logger.Error("cannot calculate new application db size")
 	}
 	logger.Info("snapshot sucessfully restored", "height", snapshot.Height, "appSize", formatSize(newAppSize))
+
+	// Verify the restored tree still hashes to the original app hash. If the snapshot
+	// export/import rehashed the tree with an incompatible iavl/store version (the
+	// celestia failure mode), the per-store roots will differ here and we abort instead
+	// of leaving a node that silently fails consensus.
+	if verifyAfterPrune {
+		if err := verifyAppState(params.appDB, ver, cInfo, keys, params.iavlDisableFastNode); err != nil {
+			return false, err
+		}
+	}
+
 	return true, nil
 }
 
