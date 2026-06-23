@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	cmtstate "github.com/cometbft/cometbft/api/cometbft/state/v1"
+	cmtstore "github.com/cometbft/cometbft/api/cometbft/store/v1"
 
 	"github.com/binaryholdings/cosmos-pruner/cmd/celestia"
 	"github.com/cosmos/gogoproto/proto"
@@ -192,11 +193,68 @@ func pruneBlockAndStateStore(blockStoreDB, stateStoreDB db.DB, pruneHeight uint6
 		return err
 	}
 
-	// We deliberately do NOT override the blockstore base. cometbft manages its own base
-	// during block pruning; deriving a base from leftover block meta can point at a
-	// stale/orphan height (e.g. an all-nines digit boundary that range deletion skips,
-	// giving base=9999999) and misreport retention. Leave base to the node.
+	// Set the blockstore base to the retain floor (pruneHeight+1) so cometbft's
+	// LoadBaseMeta(base) finds a real block meta and /status reports earliest_block_*
+	// instead of empty values. We intentionally use the retain floor rather than the
+	// global-minimum surviving "H:" key: digit-boundary all-nines metas (e.g. H:9999999)
+	// can survive deletion as orphans and would wrongly become the base. setBlockStoreBase
+	// verifies the meta actually exists before writing.
+	if err := setBlockStoreBase(blockStoreDB, pruneHeight+1); err != nil {
+		// non-fatal: a wrong/absent base only affects /status earliest_*, not node operation
+		logger.Error("failed to set blockstore base, leaving it to the node", "err", err)
+	}
+
 	logger.Info("Finished pruning block and state stores")
+	return nil
+}
+
+var blockStoreKey = []byte("blockStore")
+
+// setBlockStoreBase rewrites BlockStoreState.Base to the lowest KEPT height whose
+// block meta ("H:<height>") actually exists, scanning upward from wantBase. Verifying
+// the meta exists is what makes cometbft's LoadBaseMeta(base) succeed, so /status
+// reports earliest_block_* instead of empty values. Height is left untouched.
+func setBlockStoreBase(blockStoreDB db.DB, wantBase uint64) error {
+	raw, err := blockStoreDB.Get(blockStoreKey)
+	if err != nil {
+		return fmt.Errorf("load blockStore key: %w", err)
+	}
+	if len(raw) == 0 {
+		logger.Info("empty blockStore key, skipping base set")
+		return nil
+	}
+
+	var bss cmtstore.BlockStoreState
+	if err := proto.Unmarshal(raw, &bss); err != nil {
+		return fmt.Errorf("unmarshal BlockStoreState: %w", err)
+	}
+
+	// first height >= wantBase whose meta exists (normally wantBase itself)
+	base := wantBase
+	for ; int64(base) <= bss.Height; base++ {
+		ok, err := blockStoreDB.Has(fmt.Appendf(nil, "H:%d", base))
+		if err != nil {
+			return fmt.Errorf("probe H:%d: %w", base, err)
+		}
+		if ok {
+			break
+		}
+	}
+	if int64(base) > bss.Height {
+		logger.Warn("no surviving block meta at/above retain floor, leaving base unchanged",
+			"wantBase", wantBase, "height", bss.Height)
+		return nil
+	}
+
+	bss.Base = int64(base)
+	out, err := proto.Marshal(&bss)
+	if err != nil {
+		return fmt.Errorf("marshal BlockStoreState: %w", err)
+	}
+	if err := blockStoreDB.SetSync(blockStoreKey, out); err != nil { // fsync so the write survives
+		return fmt.Errorf("write blockStore key: %w", err)
+	}
+	logger.Info("Set blockstore base", "base", base, "height", bss.Height)
 	return nil
 }
 
