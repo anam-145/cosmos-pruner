@@ -163,8 +163,10 @@ otherwise become a bogus base. Failure to set the base is non-fatal — it only 
 `/status` reporting, not node operation.
 
 > If a node's base was already corrupted by an earlier prune (so `/status` shows empty
-> `earliest_*`), re-running `prune` fixes it. To repair without a full re-prune, see
-> [`basefix`](#basefix).
+> `earliest_*`), re-running `prune` fixes it. Note that pruning physically deletes blocks
+> below the retain window, so `earliest_block_*` can at best point at the lowest kept block
+> (`last_block_height - keep-blocks`); genesis-era earliest values are only possible on an
+> archive node.
 
 ### Application store — two strategies
 
@@ -254,30 +256,6 @@ useful for getting a correct `last_block_height` for your snapshots.
   change with pruning.
 - `earliest_block_*` is the **post-prune base block**, read from the blockstore (mirrors
   CometBFT `/status`). It is empty/zero when the base is unset or its meta was pruned.
-
----
-
-## basefix
-
-`basefix` is a standalone diagnose/repair tool for the blockstore `base` — useful for a
-node whose `/status` shows empty `earliest_*` from an **earlier** prune (before the base
-was set correctly), so you can fix it without a full re-prune. The node must be stopped.
-
-```bash
-# read-only: print stored base, whether its meta exists, and the true lowest kept height
-go run ./basefix --home /home/ubuntu/.celestia/snap-mainnet
-
-# repair: rewrite base to the lowest kept block whose meta exists (fsync + read-back)
-go run ./basefix --home /home/ubuntu/.celestia/snap-mainnet --set
-```
-
-`--backend` defaults to `goleveldb`; pass `pebbledb` if that is your DB format. After
-`--set`, start the node and check `curl -s localhost:26657/status | jq .result.sync_info`.
-
-> Pruning physically deletes blocks below the retain window — their hashes/app-hashes/times
-> are **gone**. `earliest_block_*` can at best point at the lowest kept block
-> (`last_block_height - keep-blocks`); genesis-era earliest values are only possible on an
-> archive node.
 
 ---
 
