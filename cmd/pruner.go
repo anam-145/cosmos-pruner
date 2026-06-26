@@ -370,27 +370,47 @@ func restoreVerifiedAndSwap(
 	}
 	logger.Info("restored snapshot verified, swapping into place")
 
-	// Close both DBs before the filesystem swap.
+	// Close both DBs before the filesystem swap. A close failure is fatal and must abort
+	// before the swap (same as gcDB): a failed restoreDB close means the verified copy may
+	// not be flushed/durable, and a failed original close means it may still hold file
+	// locks/handles. In either case leave the original application.db untouched and fail.
 	if err := restoreDB.Close(); err != nil {
-		logger.Error("error closing restore DB before swap", "err", err)
+		return 0, fmt.Errorf("failed to close restore DB before swap, original application.db left intact: %w", err)
 	}
-	// Null the handle as soon as it is closed so any error before the reopen below
-	// leaves params.appDB == nil, not a stale closed handle the caller would double-close.
-	_ = params.appDB.Close()
+	// Null the handle as soon as it is closed so the caller never double-closes it and so
+	// any error before the reopen below leaves params.appDB == nil, not a stale handle.
+	if err := params.appDB.Close(); err != nil {
+		params.appDB = nil
+		return 0, fmt.Errorf("failed to close original application.db before swap, left intact: %w", err)
+	}
 	params.appDB = nil
 
 	appPath := filepath.Join(params.dataDir, "application.db")
 	restoredPath := filepath.Join(restoreParent, "application.db")
+	backupPath := filepath.Join(params.dataDir, "application_old.db")
 
 	// Commit to the swap: stop auto-deleting the restored data so a mid-swap failure
 	// preserves it for manual recovery.
 	cleanupTemp = false
 
-	if err := os.RemoveAll(appPath); err != nil {
-		return 0, fmt.Errorf("failed to remove old application.db during swap (verified DB preserved at %s): %w", restoredPath, err)
+	// Swap without ever leaving application.db missing: move the original aside to a
+	// backup, move the verified restore into place, then drop the backup. If the final
+	// rename fails we restore the backup, so a failed/interrupted swap can never destroy
+	// the app DB (the previous RemoveAll-then-Rename left appPath gone on rename failure).
+	_ = os.RemoveAll(backupPath) // clear any stale backup from a prior aborted run
+	if _, statErr := os.Stat(appPath); statErr == nil {
+		if err := os.Rename(appPath, backupPath); err != nil {
+			return 0, fmt.Errorf("failed to back up old application.db during swap (verified DB preserved at %s): %w", restoredPath, err)
+		}
 	}
 	if err := os.Rename(restoredPath, appPath); err != nil {
-		return 0, fmt.Errorf("CRITICAL: old application.db removed but moving verified DB failed; recover it from %s: %w", restoredPath, err)
+		if rErr := os.Rename(backupPath, appPath); rErr != nil {
+			return 0, fmt.Errorf("CRITICAL: swap failed and original could not be restored; recover original from %s or verified restore from %s: %w", backupPath, restoredPath, err)
+		}
+		return 0, fmt.Errorf("failed to move verified restore into place, original restored (verified DB preserved at %s): %w", restoredPath, err)
+	}
+	if err := os.RemoveAll(backupPath); err != nil {
+		logger.Error("error removing application.db backup after swap, continuing", "path", backupPath, "err", err)
 	}
 	if err := os.RemoveAll(restoreParent); err != nil {
 		logger.Error("error removing now-empty restore temp dir", "err", err)
@@ -710,21 +730,26 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 
 	if pruneComet {
 		logger.Info("Pruning CometBFT data (blockstore and state)")
-		stateStoreDB, err = db.NewDB("state", dbfmt, dataDir)
-		if err != nil {
-			return err
+		// Do NOT return directly on an open failure here: the app-prune goroutine above
+		// may already be running and using appStoreDB, so an early return would let the
+		// deferred close race it. Record the error and fall through to wg.Wait()/drain,
+		// which joins it after every started goroutine finishes.
+		var openErr error
+		stateStoreDB, openErr = db.NewDB("state", dbfmt, dataDir)
+		if openErr == nil {
+			blockStoreDB, openErr = db.NewDB("blockstore", dbfmt, dataDir)
 		}
-		blockStoreDB, err = db.NewDB("blockstore", dbfmt, dataDir)
-		if err != nil {
-			return err
+		if openErr != nil {
+			errorChan <- fmt.Errorf("failed to open blockstore/state DBs: %w", openErr)
+		} else {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := pruner.PruneBlockState(blockStoreDB, stateStoreDB, pruneHeight); err != nil {
+					errorChan <- fmt.Errorf("failed to prune blockstore/state DBs: %w", err)
+				}
+			}()
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := pruner.PruneBlockState(blockStoreDB, stateStoreDB, pruneHeight); err != nil {
-				errorChan <- fmt.Errorf("failed to prune blockstore/state DBs: %w", err)
-			}
-		}()
 	}
 
 	go func() {
