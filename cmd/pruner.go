@@ -278,7 +278,10 @@ func SnapshotAndRestoreApp(params *ApplicationPrunerParams) (bool, error) {
 	// Unsafe legacy path (--verify-after-prune=false): destroy the original first, then
 	// restore. Lower peak disk, but a failed restore leaves nothing to fall back to.
 	logger.Info("removing old application.db (verify-after-prune disabled)")
+	// Null the handle as soon as it is closed so an error before the reopen below leaves
+	// params.appDB == nil, not a stale closed handle the caller would double-close.
 	_ = params.appDB.Close()
+	params.appDB = nil
 	if err := os.RemoveAll(filepath.Join(params.dataDir, "application.db")); err != nil {
 		return false, fmt.Errorf("failed to remove application.db: %w", err)
 	}
@@ -371,7 +374,10 @@ func restoreVerifiedAndSwap(
 	if err := restoreDB.Close(); err != nil {
 		logger.Error("error closing restore DB before swap", "err", err)
 	}
+	// Null the handle as soon as it is closed so any error before the reopen below
+	// leaves params.appDB == nil, not a stale closed handle the caller would double-close.
 	_ = params.appDB.Close()
+	params.appDB = nil
 
 	appPath := filepath.Join(params.dataDir, "application.db")
 	restoredPath := filepath.Join(restoreParent, "application.db")
@@ -416,59 +422,111 @@ func gcDB(dataDir string, dbName string, dbToGC db.DB, dbfmt db.BackendType) err
 
 	if err != nil {
 		logger.Error("Failed to open gc db", "err", err)
+		_ = dbToGC.Close()
 		return err
+	}
+
+	newPath := filepath.Join(dataDir, fmt.Sprintf("%s_gc.db", dbName))
+
+	// abort discards the partially written gc DB and closes the source handle
+	// WITHOUT touching the original DB on disk. A failed pass (e.g. ENOSPC mid-copy)
+	// must never swap a truncated DB into place: the original blockstore/state/app
+	// stays intact and the run fails loudly so the operator can free space and retry.
+	abort := func(stage string, cause error) error {
+		logger.Error("aborting GC, leaving original DB intact", "db", dbName, "stage", stage, "err", cause)
+		_ = newDB.Close()
+		if rmErr := os.RemoveAll(newPath); rmErr != nil {
+			logger.Error("error removing partial gc db", "path", newPath, "err", rmErr)
+		}
+		_ = dbToGC.Close()
+		return fmt.Errorf("gc %s: %s: %w", dbName, stage, cause)
 	}
 
 	// Copy only live data
 	iter, err := dbToGC.Iterator(nil, nil)
 	if err != nil {
 		logger.Error("Failed to get original db iterator", "err", err)
-		return err
+		return abort("open iterator", err)
 	}
 	batchSize := 1_000
 	batch := newDB.NewBatch()
-	count := 0
+	count := 0 // keys buffered in the current unflushed batch
+	total := 0 // total live keys copied, independent of batch flushing
 
 	for ; iter.Valid(); iter.Next() {
-		_ = batch.Set(iter.Key(), iter.Value())
+		if err := batch.Set(iter.Key(), iter.Value()); err != nil {
+			_ = batch.Close()
+			_ = iter.Close()
+			return abort("batch set", err)
+		}
 		count++
+		total++
 
 		if count >= batchSize {
 			if err := batch.Write(); err != nil {
-				logger.Error("error writing batch, continuing", "err", err)
+				_ = batch.Close()
+				_ = iter.Close()
+				return abort("batch write", err)
 			}
-
 			if err := batch.Close(); err != nil {
-				logger.Error("error closing batch: continuing", "err", err)
+				_ = iter.Close()
+				return abort("batch close", err)
 			}
 			batch = newDB.NewBatch()
 			count = 0
 		}
 	}
-	logger.Info("Finished GC, closing", "db", dbName)
+
+	if err := iter.Error(); err != nil {
+		_ = batch.Close()
+		_ = iter.Close()
+		return abort("iterate source", err)
+	}
+
+	logger.Info("Finished GC, closing", "db", dbName, "keysCopied", total)
 
 	if count > 0 {
 		if err := batch.Write(); err != nil {
-			logger.Error("error writing batch, continuing", "err", err)
+			_ = batch.Close()
+			_ = iter.Close()
+			return abort("final batch write", err)
 		}
 	}
 
-	_ = iter.Close()
-
 	if err := batch.Close(); err != nil {
-		logger.Error("error closing batch, continuing", "err", err)
+		_ = iter.Close()
+		return abort("final batch close", err)
+	}
+	// Iterator close is read-side cleanup only; iter.Error() above already gated the
+	// copy's completeness, so a close error here is logged but not fatal.
+	if err := iter.Close(); err != nil {
+		logger.Error("error closing source iterator, continuing", "db", dbName, "err", err)
 	}
 
-	if err := dbToGC.Close(); err != nil {
-		logger.Error("error closing gc db, continuing", "err", err)
-	}
-
+	// Close the new DB before any file swap so its writes are flushed/durable.
+	// A close error means the copy may be incomplete: discard it, keep the original.
 	if err := newDB.Close(); err != nil {
-		logger.Error("error closing newdb, continuing", "err", err)
+		if rmErr := os.RemoveAll(newPath); rmErr != nil {
+			logger.Error("error removing partial gc db", "path", newPath, "err", rmErr)
+		}
+		_ = dbToGC.Close()
+		return fmt.Errorf("gc %s: close new db: %w", dbName, err)
 	}
 
-	newPath := filepath.Join(dataDir, fmt.Sprintf("%s_gc.db", dbName))
-	if count == 0 {
+	// Source must be fully closed before we delete/rename its files. If the close
+	// fails the backend may still hold file handles/locks, so do not risk the swap:
+	// discard the (good) gc copy and leave the original in place for a retry.
+	if err := dbToGC.Close(); err != nil {
+		logger.Error("failed to close source db, aborting swap and keeping original", "db", dbName, "err", err)
+		if rmErr := os.RemoveAll(newPath); rmErr != nil {
+			logger.Error("error removing gc copy after source close failure", "path", newPath, "err", rmErr)
+		}
+		return fmt.Errorf("gc %s: close source db: %w", dbName, err)
+	}
+
+	// Use total (not the batch-local count, which resets every batchSize keys) so a
+	// DB whose live-key count is an exact multiple of batchSize is not misread as empty.
+	if total == 0 {
 		logger.Info("gc complete, but empty")
 		if err := os.RemoveAll(newPath); err != nil {
 			logger.Error("error removing files", "path", newPath, "err", err)
@@ -477,13 +535,31 @@ func gcDB(dataDir string, dbName string, dbToGC db.DB, dbfmt db.BackendType) err
 	}
 
 	oldPath := filepath.Join(dataDir, fmt.Sprintf("%s.db", dbName))
+	backupPath := filepath.Join(dataDir, fmt.Sprintf("%s_old.db", dbName))
 
-	if err := os.RemoveAll(oldPath); err != nil {
-		logger.Error("error removing files", "path", oldPath, "err", err)
+	// Swap without ever leaving oldPath missing: move the original aside to a backup,
+	// move the gc copy into place, then drop the backup. If the final rename fails we
+	// restore the backup, so a failed swap can never destroy the live DB (the previous
+	// RemoveAll-then-Rename left oldPath gone if the rename failed).
+	_ = os.RemoveAll(backupPath) // clear any stale backup from a prior aborted run
+	if _, statErr := os.Stat(oldPath); statErr == nil {
+		if err := os.Rename(oldPath, backupPath); err != nil {
+			logger.Error("Failed to back up original DB before swap, leaving it intact", "err", err)
+			_ = os.RemoveAll(newPath)
+			return fmt.Errorf("gc %s: back up original: %w", dbName, err)
+		}
 	}
 	if err := os.Rename(newPath, oldPath); err != nil {
-		logger.Error("Failed to swap GC DB", "err", err)
-		return err
+		logger.Error("Failed to swap GC DB, restoring original", "err", err)
+		if rErr := os.Rename(backupPath, oldPath); rErr != nil {
+			logger.Error("CRITICAL: swap failed and original could not be restored; recover it manually", "backup", backupPath, "err", rErr)
+			return fmt.Errorf("gc %s: swap failed, original preserved at %s: %w", dbName, backupPath, err)
+		}
+		_ = os.RemoveAll(newPath)
+		return fmt.Errorf("gc %s: swap new db: %w", dbName, err)
+	}
+	if err := os.RemoveAll(backupPath); err != nil {
+		logger.Error("error removing gc backup, continuing", "path", backupPath, "err", err)
 	}
 
 	return nil
@@ -500,14 +576,19 @@ type gcRunOptions struct {
 }
 
 func maybeRunGC(opts gcRunOptions) error {
+	// gcDB takes ownership of opts.db and closes it on every path. The early returns
+	// below do NOT call gcDB, and Prune nils its outer handle after scheduling this,
+	// so they must close opts.db themselves or the handle (and its DB lock) leaks.
 	size, err := dirSize(opts.sizePath)
 	if err != nil {
 		logger.Error("Failed to get dir size, skipping GC", "path", opts.sizePath, "err", err)
+		_ = opts.db.Close()
 		return err
 	}
 
 	if (size >= gcSizeThreshold && !forceCompress) || opts.snapshotted {
 		logger.Info(fmt.Sprintf("Skipping %s DB compaction", opts.label), "size", formatSize(size), "threshold", formatSize(gcSizeThreshold), "snapshotted", opts.snapshotted)
+		_ = opts.db.Close()
 		return nil
 	}
 
@@ -590,6 +671,10 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 	var wg sync.WaitGroup
 	errorChan := make(chan error, 2)
 
+	// Held so we can pick up the handle PruneApp leaves in params.appDB: the snapshot
+	// path closes the original and REOPENS a fresh handle there, so appStoreDB (the
+	// original) would otherwise be a stale/closed handle while the live one leaked.
+	var appParams *ApplicationPrunerParams
 	snapshotted := false
 	if pruneApp {
 		logger.Info("Pruning application data")
@@ -601,20 +686,24 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 		if err != nil {
 			return err
 		}
+		appParams = &ApplicationPrunerParams{
+			appDB:                    appStoreDB,
+			snapshotDB:               snapshotDB,
+			dataDir:                  dataDir,
+			dbfmt:                    dbfmt,
+			pruneHeight:              pruneHeight,
+			snapshotRestoreThreshold: pruner.SnapshotRestoreThreshold,
+			iavlDisableFastNode:      iavlDisableFastNode,
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			snapshotted, err = pruner.PruneApp(&ApplicationPrunerParams{
-				appDB:                    appStoreDB,
-				snapshotDB:               snapshotDB,
-				dataDir:                  dataDir,
-				dbfmt:                    dbfmt,
-				pruneHeight:              pruneHeight,
-				snapshotRestoreThreshold: pruner.SnapshotRestoreThreshold,
-				iavlDisableFastNode:      iavlDisableFastNode,
-			})
-			if err != nil {
-				errorChan <- fmt.Errorf("failed to prune application DB: %w", err)
+			// Goroutine-local error: writing the outer err here would race with the
+			// main goroutine's db.NewDB(...) assignments to err in the pruneComet block.
+			var appErr error
+			snapshotted, appErr = pruner.PruneApp(appParams)
+			if appErr != nil {
+				errorChan <- fmt.Errorf("failed to prune application DB: %w", appErr)
 			}
 		}()
 	}
@@ -648,6 +737,15 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 		errs = append(errs, err)
 	}
 
+	// PruneApp (snapshot path) closes the original app handle and reopens a fresh one
+	// in appParams.appDB (or leaves it nil if the swap failed before reopening). Adopt
+	// it BEFORE any return so the GC pass and the deferred close operate on the live
+	// handle, not the closed original — even on the error path, where the legacy restore
+	// could otherwise leak a freshly opened handle and double-close the stale one.
+	if appParams != nil {
+		appStoreDB = appParams.appDB
+	}
+
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -655,6 +753,11 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 	if runGC {
 		g, _ := errgroup.WithContext(context.Background())
 
+		// blockstore/state always GC regardless of snapshotted: only the application DB
+		// is rebuilt by SnapshotAndRestoreApp, so only it is already compact. The
+		// blockstore/state stores are pruned in place (tombstoned, not reclaimed), so
+		// skipping their GC when the app was snapshotted leaves them bloated until a
+		// second pass. The size-threshold gate in maybeRunGC still applies.
 		if pruneComet && blockStoreDB != nil && stateStoreDB != nil {
 			dbToGCOnBlock := blockStoreDB
 			g.Go(func() error {
@@ -665,7 +768,7 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 					dataDir:     dataDir,
 					dbfmt:       dbfmt,
 					db:          dbToGCOnBlock,
-					snapshotted: snapshotted,
+					snapshotted: false,
 				})
 			})
 			blockStoreDB = nil
@@ -679,7 +782,7 @@ func Prune(dataDir string, pruneComet, pruneApp, iavlDisableFastNode bool) error
 					dataDir:     dataDir,
 					dbfmt:       dbfmt,
 					db:          dbToGCOnState,
-					snapshotted: snapshotted,
+					snapshotted: false,
 				})
 			})
 			stateStoreDB = nil
