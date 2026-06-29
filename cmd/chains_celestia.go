@@ -22,7 +22,7 @@ func init() {
 	celestiaSnapshotConfig := ChainPruner{
 		PruneBlockState:          pruneBlockAndStateStore,
 		PruneApp:                 SnapshotAndRestoreApp,
-		SnapshotRestoreThreshold: 10 * GiB,
+		SnapshotRestoreThreshold: 5 * GiB,
 	}
 	chainConfigs["celestia"] = celestiaSnapshotConfig
 	chainConfigs["mocha-4"] = celestiaSnapshotConfig
